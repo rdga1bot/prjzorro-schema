@@ -127,7 +127,7 @@ components:
         total:   { type: integer }
         page:    { type: integer }
         per_page: { type: integer }
-        cursor:  { type: string, nullable: true }
+        cursor:  { type: [string, 'null'] }
 
     CompanyProfile:
       type: object
@@ -177,8 +177,8 @@ components:
       properties:
         id:          { type: string, format: uuid }
         name:        { type: string }
-        org_name:    { type: string, nullable: true }
-        org_logo_url: { type: string, nullable: true, format: uri }
+        org_name:    { type: [string, 'null'] }
+        org_logo_url: { type: [string, 'null'], format: uri }
         is_active:   { type: boolean }
         created_at:  { type: string, format: date-time }
         key:
@@ -189,8 +189,8 @@ components:
       type: object
       properties:
         key_name:     { type: string }
-        org_name:     { type: string, nullable: true }
-        org_logo_url: { type: string, nullable: true, format: uri }
+        org_name:     { type: [string, 'null'] }
+        org_logo_url: { type: [string, 'null'], format: uri }
 
 # ─────────────────────────────────────────────────────────────
 paths:
