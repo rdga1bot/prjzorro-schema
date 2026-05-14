@@ -1,0 +1,17 @@
+name: OpenAPI lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint openapi.yaml
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: npx --yes @redocly/cli@latest lint openapi.yaml --format=summary
