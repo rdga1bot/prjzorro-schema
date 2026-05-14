@@ -1,0 +1,918 @@
+openapi: "3.1.0"
+
+info:
+  title: prjzorro API
+  version: "1.0.0"
+  description: |
+    REST API for Ukrainian public procurement analytics (Prozorro data, CC BY).
+    Base URL: https://api.example.com
+  license:
+    name: CC BY 4.0
+    url: https://creativecommons.org/licenses/by/4.0/
+
+servers:
+  - url: /api/v1
+
+security: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    edrpou:
+      name: edrpou
+      in: path
+      required: true
+      schema: { type: string, pattern: "^\\d{8}$" }
+      description: 8-digit EDRPOU code (leading zeros preserved)
+    tender_id:
+      name: tender_id
+      in: path
+      required: true
+      schema: { type: string }
+    page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    per_page:
+      name: per_page
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque pagination cursor (alternative to page)
+    sort_by:
+      name: sort_by
+      in: query
+      schema: { type: string, enum: [date_modified, value_amount, risk_score] }
+    sort_order:
+      name: sort_order
+      in: query
+      schema: { type: string, enum: [asc, desc], default: desc }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail: { type: string }
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token:  { type: string }
+        refresh_token: { type: string }
+        token_type:    { type: string, example: bearer }
+        plan:          { type: string, enum: [free, pro, enterprise] }
+        email:         { type: string, format: email }
+
+    TenderSummary:
+      type: object
+      properties:
+        id:             { type: string }
+        title:          { type: string }
+        status:         { type: string }
+        procedure_type: { type: string }
+        value_amount:   { type: number }
+        currency:       { type: string }
+        buyer_edrpou:   { type: string }
+        buyer_name:     { type: string }
+        region:         { type: string }
+        date_modified:  { type: string, format: date-time }
+        risk_score:     { type: number, minimum: 0, maximum: 1 }
+        risk_level:     { type: string, enum: [none, low, medium, high, critical] }
+
+    TenderDetail:
+      allOf:
+        - $ref: "#/components/schemas/TenderSummary"
+        - type: object
+          properties:
+            cpv_code:       { type: string }
+            dk_code:        { type: string }
+            description:    { type: string }
+            date_created:   { type: string, format: date-time }
+            flags:
+              type: array
+              items:
+                type: object
+                properties:
+                  code:        { type: string, example: R001 }
+                  severity:    { type: string, enum: [info, low, medium, high, critical] }
+                  description: { type: string }
+            bids:
+              type: array
+              items:
+                type: object
+                properties:
+                  bidder_edrpou: { type: string }
+                  bidder_name:   { type: string }
+                  value_amount:  { type: number }
+                  status:        { type: string }
+
+    PaginatedTenders:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/TenderSummary" }
+        total:   { type: integer }
+        page:    { type: integer }
+        per_page: { type: integer }
+        cursor:  { type: string, nullable: true }
+
+    CompanyProfile:
+      type: object
+      properties:
+        edrpou:              { type: string }
+        name:                { type: string }
+        region:              { type: string }
+        risk_score:          { type: number }
+        as_buyer_count:      { type: integer }
+        as_supplier_count:   { type: integer }
+        total_amount:        { type: number }
+        sanctions_hit:       { type: boolean }
+
+    NetworkGraph:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:    { type: string }
+              name:  { type: string }
+              type:  { type: string, enum: [buyer, supplier] }
+              risk:  { type: number }
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source: { type: string }
+              target: { type: string }
+              weight: { type: integer }
+
+    Webhook:
+      type: object
+      properties:
+        id:         { type: string, format: uuid }
+        url:        { type: string, format: uri }
+        events:     { type: array, items: { type: string } }
+        is_active:  { type: boolean }
+        secret:     { type: string }
+        created_at: { type: string, format: date-time }
+
+    APIKey:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        name:        { type: string }
+        org_name:    { type: string, nullable: true }
+        org_logo_url: { type: string, nullable: true, format: uri }
+        is_active:   { type: boolean }
+        created_at:  { type: string, format: date-time }
+        key:
+          type: string
+          description: Shown only on creation
+
+    OrgBranding:
+      type: object
+      properties:
+        key_name:     { type: string }
+        org_name:     { type: string, nullable: true }
+        org_logo_url: { type: string, nullable: true, format: uri }
+
+# ─────────────────────────────────────────────────────────────
+paths:
+
+  # ── Tenders ─────────────────────────────────────────────────
+  /tenders:
+    get:
+      operationId: listTenders
+      summary: List tenders with filters
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/per_page"
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/sort_by"
+        - $ref: "#/components/parameters/sort_order"
+        - { name: status,              in: query, schema: { type: string } }
+        - { name: procedure_type,      in: query, schema: { type: string } }
+        - { name: region,              in: query, schema: { type: string } }
+        - { name: cpv_code,            in: query, schema: { type: string } }
+        - { name: buyer_edrpou,        in: query, schema: { type: string } }
+        - { name: buyer_name,          in: query, schema: { type: string } }
+        - { name: participant_edrpou,  in: query, schema: { type: string } }
+        - { name: risk_level,          in: query, schema: { type: string, enum: [none, low, medium, high, critical] } }
+        - { name: flag_type,           in: query, schema: { type: string, example: R001 } }
+        - { name: amount_min,          in: query, schema: { type: number } }
+        - { name: amount_max,          in: query, schema: { type: number } }
+        - { name: date_from,           in: query, schema: { type: string, format: date } }
+        - { name: date_to,             in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedTenders" }
+
+  /tenders/{tender_id}:
+    get:
+      operationId: getTender
+      summary: Get tender detail
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenderDetail" }
+        "404": { description: Not found, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  /tenders/{tender_id}/similar:
+    get:
+      operationId: getSimilarTenders
+      summary: Tenders similar by CPV and value
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/TenderSummary" } }
+
+  /tenders/{tender_id}/spending:
+    get:
+      operationId: getTenderSpending
+      summary: Buyer historical spending on same CPV
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+        - { name: limit, in: query, schema: { type: integer, default: 12 } }
+      responses:
+        "200": { description: OK }
+
+  /tenders/{tender_id}/benchmark:
+    get:
+      operationId: getTenderBenchmark
+      summary: CPV price benchmark vs market stats
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+      responses:
+        "200": { description: OK }
+
+  /tenders/{tender_id}/related:
+    get:
+      operationId: getRelatedTenders
+      summary: Tenders from same buyer/supplier pair
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        "200": { description: OK }
+
+  /tenders/{tender_id}/report.pdf:
+    get:
+      operationId: getTenderReportPdf
+      summary: Download tender risk report as PDF
+      tags: [Tenders]
+      parameters:
+        - $ref: "#/components/parameters/tender_id"
+      responses:
+        "200":
+          description: PDF file
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+
+  # ── Companies ────────────────────────────────────────────────
+  /companies/{edrpou}:
+    get:
+      operationId: getCompanyProfile
+      summary: Company profile and risk summary
+      tags: [Companies]
+      parameters:
+        - $ref: "#/components/parameters/edrpou"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CompanyProfile" }
+        "404": { description: Not found }
+
+  /companies/{edrpou}/tenders:
+    get:
+      operationId: getCompanyTenders
+      summary: Tenders where company is buyer or supplier
+      tags: [Companies]
+      parameters:
+        - $ref: "#/components/parameters/edrpou"
+        - { name: role, in: query, schema: { type: string, enum: [buyer, supplier] } }
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/per_page"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedTenders" }
+
+  /companies/{edrpou}/network:
+    get:
+      operationId: getCompanyNetwork
+      summary: Company relationship graph (buyers ↔ suppliers)
+      tags: [Companies]
+      parameters:
+        - $ref: "#/components/parameters/edrpou"
+        - { name: depth, in: query, schema: { type: integer, minimum: 1, maximum: 3, default: 1 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NetworkGraph" }
+
+  /companies/{edrpou}/report.pdf:
+    get:
+      operationId: getCompanyReportPdf
+      summary: Download company risk report as PDF
+      tags: [Companies]
+      parameters:
+        - $ref: "#/components/parameters/edrpou"
+      responses:
+        "200":
+          description: PDF file
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "501": { description: Not implemented }
+
+  # ── Hromada ──────────────────────────────────────────────────
+  /hromada:
+    get:
+      operationId: listRegions
+      summary: Aggregated stats by region
+      tags: [Hromada]
+      responses:
+        "200": { description: OK }
+
+  /hromada/{region}:
+    get:
+      operationId: getRegion
+      summary: Stats for a single region
+      tags: [Hromada]
+      parameters:
+        - { name: region, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  # ── Search ───────────────────────────────────────────────────
+  /search:
+    get:
+      operationId: search
+      summary: Full-text search across tenders and companies
+      tags: [Search]
+      parameters:
+        - { name: q,    in: query, required: true, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string, enum: [tenders, companies, all], default: all } }
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/per_page"
+      responses:
+        "200": { description: OK }
+
+  /search/autocomplete:
+    get:
+      operationId: autocomplete
+      summary: Autocomplete suggestions (top 5 per type)
+      tags: [Search]
+      parameters:
+        - { name: q,    in: query, required: true, schema: { type: string, minLength: 2 } }
+        - { name: type, in: query, schema: { type: string, enum: [tenders, companies, all], default: all } }
+      responses:
+        "200": { description: OK }
+
+  # ── Export ───────────────────────────────────────────────────
+  /export/tenders:
+    get:
+      operationId: exportTenders
+      summary: Export tenders as CSV or XLSX
+      tags: [Export]
+      parameters:
+        - { name: format, in: query, required: true, schema: { type: string, enum: [csv, xlsx] } }
+        - $ref: "#/components/parameters/sort_by"
+        - $ref: "#/components/parameters/sort_order"
+        - { name: status,             in: query, schema: { type: string } }
+        - { name: procedure_type,     in: query, schema: { type: string } }
+        - { name: region,             in: query, schema: { type: string } }
+        - { name: cpv_code,           in: query, schema: { type: string } }
+        - { name: buyer_edrpou,       in: query, schema: { type: string } }
+        - { name: buyer_name,         in: query, schema: { type: string } }
+        - { name: participant_edrpou, in: query, schema: { type: string } }
+        - { name: risk_level,         in: query, schema: { type: string } }
+        - { name: flag_type,          in: query, schema: { type: string } }
+        - { name: amount_min,         in: query, schema: { type: number } }
+        - { name: amount_max,         in: query, schema: { type: number } }
+        - { name: date_from,          in: query, schema: { type: string, format: date } }
+        - { name: date_to,            in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: File download
+          content:
+            text/csv:
+              schema: { type: string }
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+
+  # ── Stats ────────────────────────────────────────────────────
+  /stats/dashboard:
+    get:
+      operationId: getDashboard
+      summary: Dashboard summary — totals, risk breakdown, regional map
+      tags: [Stats]
+      responses:
+        "200": { description: OK }
+
+  /stats/cpv:
+    get:
+      operationId: getCpvStats
+      summary: CPV category breakdown by amount and count
+      tags: [Stats]
+      parameters:
+        - { name: division, in: query, schema: { type: string }, description: "CPV division prefix (e.g. '45')" }
+      responses:
+        "200": { description: OK }
+
+  /stats/trend:
+    get:
+      operationId: getTrend
+      summary: Procurement trend over time
+      tags: [Stats]
+      parameters:
+        - { name: days,           in: query, schema: { type: integer, default: 90 } }
+        - { name: region,         in: query, schema: { type: string } }
+        - { name: procedure_type, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /stats/top-suppliers:
+    get:
+      operationId: getTopSuppliers
+      summary: Top suppliers by total contract value
+      tags: [Stats]
+      parameters:
+        - { name: month, in: query, schema: { type: string, pattern: "^\\d{4}-\\d{2}$" }, description: "YYYY-MM" }
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        "200": { description: OK }
+
+  /stats/risk-leaders:
+    get:
+      operationId: getRiskLeaders
+      summary: Top risky buyers and suppliers
+      tags: [Stats]
+      parameters:
+        - { name: limit,     in: query, schema: { type: integer, default: 10 } }
+        - { name: flag_type, in: query, schema: { type: string, example: R001 } }
+      responses:
+        "200": { description: OK }
+
+  # ── Auth ─────────────────────────────────────────────────────
+  /auth/register:
+    post:
+      operationId: registerUser
+      summary: Register new user account
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:    { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "409": { description: Email already registered }
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: Authenticate and get JWT tokens
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:    { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { description: Invalid credentials }
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      summary: Exchange refresh token for new access token
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Invalidate refresh token
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /auth/me:
+    get:
+      operationId: getAuthProfile
+      summary: Get current user profile
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:      { type: string }
+                  plan:       { type: string }
+                  created_at: { type: string, format: date-time }
+        "401": { description: Unauthorized }
+    delete:
+      operationId: deleteAccount
+      summary: Permanently delete account (GDPR Art.17)
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: OK }
+        "401": { description: Unauthorized }
+
+  /auth/keys:
+    post:
+      operationId: createAPIKey
+      summary: Create API key
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, name]
+              properties:
+                email:    { type: string, format: email }
+                password: { type: string }
+                name:     { type: string }
+      responses:
+        "201":
+          description: Created — key shown only once
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/APIKey" }
+    get:
+      operationId: listAPIKeys
+      summary: List API keys for an account
+      tags: [Auth]
+      parameters:
+        - { name: email, in: query, required: true, schema: { type: string, format: email } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/APIKey" } }
+
+  /auth/keys/{key_id}:
+    delete:
+      operationId: revokeAPIKey
+      summary: Revoke an API key
+      tags: [Auth]
+      parameters:
+        - { name: key_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK }
+
+  /auth/org:
+    get:
+      operationId: getOrgBranding
+      summary: Get org branding for an API key (white-label)
+      tags: [Auth]
+      security:
+        - apiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrgBranding" }
+
+  # ── Users ────────────────────────────────────────────────────
+  /users/me/data:
+    get:
+      operationId: getMyData
+      summary: Export all personal data (GDPR Art.20)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: OK }
+        "401": { description: Unauthorized }
+
+  # ── Orgs ─────────────────────────────────────────────────────
+  /orgs:
+    post:
+      operationId: createOrg
+      summary: Create organisation
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug]
+              properties:
+                name:        { type: string }
+                slug:        { type: string, pattern: "^[a-z0-9-]+$" }
+                logo_url:    { type: string, format: uri }
+                rate_limit:  { type: integer, default: 1000 }
+      responses:
+        "201": { description: Created }
+        "409": { description: Slug already taken }
+
+  /orgs/me:
+    get:
+      operationId: listMyOrgs
+      summary: List organisations I own or belong to
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: OK }
+
+  /orgs/{slug}:
+    get:
+      operationId: getOrg
+      summary: Get organisation details
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { description: Not found }
+
+  /orgs/{slug}/members:
+    get:
+      operationId: getOrgMembers
+      summary: List organisation members
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /orgs/{slug}/invite:
+    post:
+      operationId: inviteMember
+      summary: Send member invitation email
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role:  { type: string, enum: [member, admin], default: member }
+      responses:
+        "200": { description: Invitation sent }
+
+  /orgs/{slug}/invite/accept:
+    post:
+      operationId: acceptInvite
+      summary: Accept invitation via token (no auth required)
+      tags: [Orgs]
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200": { description: Joined organisation }
+        "410": { description: Token expired or invalid }
+
+  /orgs/{slug}/members/{email}:
+    delete:
+      operationId: removeOrgMember
+      summary: Remove member from organisation
+      tags: [Orgs]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: slug,  in: path, required: true, schema: { type: string } }
+        - { name: email, in: path, required: true, schema: { type: string, format: email } }
+      responses:
+        "200": { description: Removed }
+        "403": { description: Not org owner }
+
+  # ── Alerts ───────────────────────────────────────────────────
+  /alerts:
+    post:
+      operationId: createAlert
+      summary: Subscribe to email alerts for a buyer/CPV filter
+      tags: [Alerts]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:        { type: string, format: email }
+                buyer_edrpou: { type: string }
+                cpv_code:     { type: string }
+                risk_level:   { type: string, enum: [low, medium, high, critical] }
+      responses:
+        "201": { description: Created }
+    get:
+      operationId: listAlerts
+      summary: List alerts for an email address
+      tags: [Alerts]
+      parameters:
+        - { name: email, in: query, required: true, schema: { type: string, format: email } }
+      responses:
+        "200": { description: OK }
+
+  /alerts/{alert_id}:
+    delete:
+      operationId: deleteAlert
+      summary: Unsubscribe alert
+      tags: [Alerts]
+      parameters:
+        - { name: alert_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Deleted }
+
+  # ── Webhooks ─────────────────────────────────────────────────
+  /webhooks:
+    post:
+      operationId: createWebhook
+      summary: Register a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url:    { type: string, format: uri }
+                events:
+                  type: array
+                  items: { type: string, enum: [tender.flagged, tender.high_risk, tender.completed] }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+    get:
+      operationId: listWebhooks
+      summary: List webhooks for current user
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Webhook" } }
+
+  /webhooks/{id}:
+    delete:
+      operationId: deleteWebhook
+      summary: Delete a webhook
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Deleted }
+
+  /webhooks/{id}/deliveries:
+    get:
+      operationId: getWebhookDeliveries
+      summary: Recent delivery attempts for a webhook
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: OK }
+
+  /webhooks/{id}/test:
+    post:
+      operationId: testWebhook
+      summary: Send a test event to a webhook URL
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Test event sent }
